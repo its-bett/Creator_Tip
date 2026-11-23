@@ -56,6 +56,8 @@ The service role key is used only in server components and route handlers. Never
 
 ## Enable M-Pesa (sandbox first)
 
+New to Daraja? Follow the step-by-step [sandbox setup guide](docs/MPESA_SANDBOX.md) to create an account, attach the M-Pesa Express product, find the shortcode/passkey and expose a callback URL.
+
 1. Get credentials from the [Safaricom Developer Portal](https://developer.safaricom.co.ke/).
 2. Set in `.env.local`:
 
@@ -133,4 +135,6 @@ src/
     types.ts, seed.ts, validation.ts, rate-limit.ts
 supabase/
   schema.sql, seed.sql
+docs/
+  MPESA_SANDBOX.md             # Daraja sandbox onboarding + test flow
 ```
