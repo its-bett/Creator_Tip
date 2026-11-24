@@ -54,6 +54,8 @@ SUPABASE_SERVICE_ROLE_KEY=<service-role-key>
 
 The service role key is used only in server components and route handlers. Never prefix it with `NEXT_PUBLIC_`.
 
+If either Supabase variable is unset, the app uses the local `.data/store.json` file store instead — no database setup required. If both are set but requests fail with `permission denied for table creators` or similar, the key's role lacks privileges (or the schema has not been applied in that project): re-run `supabase/schema.sql` and confirm the key belongs to the same project. Comment out both variables to return to file-store mode while testing payments.
+
 ## Enable M-Pesa (sandbox first)
 
 New to Daraja? Follow the step-by-step [sandbox setup guide](docs/MPESA_SANDBOX.md) to create an account, attach the M-Pesa Express product, find the shortcode/passkey and expose a callback URL.
