@@ -1,4 +1,4 @@
-import { timingSafeEqual } from "node:crypto";
+import { createHmacSignature, safeEqualStrings } from "@/lib/crypto";
 import { normalizePhoneNumber, isValidPhoneNumber } from "@/lib/phone";
 
 export { normalizePhoneNumber, isValidPhoneNumber };
@@ -30,12 +30,25 @@ export function getMpesaConfig(): MpesaConfig | null {
   };
 }
 
+/**
+ * Live mode needs Daraja credentials plus a reachable, authenticated callback.
+ * A missing callback URL would silently strand paid tips, so require all six
+ * values before presenting M-Pesa as live.
+ */
 export function isMpesaConfigured(): boolean {
-  return getMpesaConfig() !== null;
+  return (
+    getMpesaConfig() !== null &&
+    Boolean(process.env.MPESA_CALLBACK_URL && process.env.MPESA_CALLBACK_SECRET)
+  );
 }
 
-export function createCheckoutRequestId(prefix = "ws"): string {
+export function createCheckoutRequestId(prefix = "local"): string {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}`;
+}
+
+/** Matches local placeholders only; real Daraja IDs also begin with `ws_`. */
+export function isPlaceholderCheckoutRequestId(value: string): boolean {
+  return /^(?:local_[0-9a-f]{20}|ws_[0-9a-f]{20})$/.test(value);
 }
 
 export function createAccountReference(): string {
@@ -194,18 +207,114 @@ export async function initiateStkPush(args: StkPushArgs): Promise<StkPushResult>
   };
 }
 
+/* ------------------------------- STK query ----------------------------------- */
+
+export type StkQueryResult = {
+  resultCode: string;
+  resultDescription: string;
+  merchantRequestId: string | null;
+  checkoutRequestId: string;
+};
+
+/** Query Daraja when a callback is missing or slow. Never sends money. */
+export async function queryStkStatus(checkoutRequestId: string): Promise<StkQueryResult> {
+  const config = getMpesaConfig();
+  if (!config) throw new Error("M-Pesa is not configured.");
+  if (!checkoutRequestId || isPlaceholderCheckoutRequestId(checkoutRequestId)) {
+    throw new Error("No Daraja checkout request to query yet.");
+  }
+
+  const accessToken = await getAccessToken();
+  const timestamp = darajaTimestamp();
+  const password = Buffer.from(
+    `${config.shortcode}${config.passkey}${timestamp}`,
+  ).toString("base64");
+
+  const response = await fetch(`${config.baseUrl}/mpesa/stkpushquery/v1/query`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      BusinessShortCode: config.shortcode,
+      Password: password,
+      Timestamp: timestamp,
+      CheckoutRequestID: checkoutRequestId,
+    }),
+    signal: AbortSignal.timeout(15_000),
+    cache: "no-store",
+  });
+
+  if (!response.ok) {
+    throw new Error(`M-Pesa STK query failed (${response.status}).`);
+  }
+
+  const data = (await response.json()) as {
+    MerchantRequestID?: string;
+    CheckoutRequestID?: string;
+    ResultCode?: string | number;
+    ResultDesc?: string;
+    ResponseCode?: string;
+    ResponseDescription?: string;
+    errorCode?: string;
+    errorDescription?: string;
+  };
+
+  // A rejected query uses ResponseCode/errorDescription instead of ResultCode.
+  if (data.ResultCode === undefined && data.ResponseCode !== "0") {
+    throw new Error(
+      data.errorDescription || data.ResponseDescription || "M-Pesa could not check the payment.",
+    );
+  }
+
+  return {
+    resultCode: String(data.ResultCode ?? ""),
+    resultDescription: String(data.ResultDesc ?? data.ResponseDescription ?? "Payment update received"),
+    merchantRequestId: data.MerchantRequestID ? String(data.MerchantRequestID) : null,
+    checkoutRequestId: String(data.CheckoutRequestID ?? checkoutRequestId),
+  };
+}
+
 /* --------------------------------- callbacks --------------------------------- */
 
-export function isCallbackAuthorized(request: Request): boolean {
-  const expected = process.env.MPESA_CALLBACK_SECRET;
-  if (!expected) return true;
+export function signCallbackTransaction(transactionId: string): string {
+  const secret = process.env.MPESA_CALLBACK_SECRET;
+  if (!secret) throw new Error("MPESA_CALLBACK_SECRET is not configured.");
+  return createHmacSignature(transactionId, secret);
+}
 
-  const supplied =
-    new URL(request.url).searchParams.get("secret") ??
-    request.headers.get("x-mpesa-secret") ??
-    "";
+/**
+ * Each STK push gets its own signed callback URL. The transaction ID lets us
+ * match the callback even if the Daraja checkout ID update fails, and the HMAC
+ * stops anyone from forging a result for another transaction.
+ */
+export function buildMpesaCallbackUrl(callbackBase: string, transactionId: string): string {
+  const url = new URL(callbackBase);
+  if (process.env.NODE_ENV === "production" && url.protocol !== "https:") {
+    throw new Error("MPESA_CALLBACK_URL must use HTTPS in production.");
+  }
+  url.searchParams.set("tipId", transactionId);
+  url.searchParams.set("sig", signCallbackTransaction(transactionId));
+  return url.toString();
+}
 
-  const a = Buffer.from(expected);
-  const b = Buffer.from(supplied);
-  return a.length === b.length && timingSafeEqual(a, b);
+/** Returns the transaction ID only when the callback URL signature is valid. */
+export function verifyMpesaCallback(request: Request): { transactionId: string | null } | null {
+  const secret = process.env.MPESA_CALLBACK_SECRET;
+  if (!secret) return null;
+
+  const url = new URL(request.url);
+  const transactionId = url.searchParams.get("tipId");
+  const signature = url.searchParams.get("sig");
+
+  if (transactionId && signature) {
+    const expected = createHmacSignature(transactionId, secret);
+    return safeEqualStrings(expected, signature) ? { transactionId } : null;
+  }
+
+  // Accept callbacks already in flight from the previous static-secret format.
+  const legacySecret =
+    url.searchParams.get("secret") ?? request.headers.get("x-mpesa-secret") ?? "";
+  return safeEqualStrings(secret, legacySecret) ? { transactionId: null } : null;
 }

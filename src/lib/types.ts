@@ -1,5 +1,8 @@
 export type TransactionStatus = "PENDING" | "SUCCESS" | "FAILED";
 
+export const PAYMENT_TIMEOUT_REASON = "The payment prompt expired. Please try again.";
+export const LATE_CALLBACK_GRACE_MINUTES = 60 * 24;
+
 export type PaymentMethod = "mpesa" | "airtel" | "paypal" | "binance";
 
 export type Creator = {
@@ -87,6 +90,10 @@ export type Transaction = {
   status: TransactionStatus;
   mpesaReceiptNumber: string | null;
   checkoutRequestId: string;
+  merchantRequestId: string | null;
+  accountReference: string | null;
+  /** Secret, per-transaction token required when polling payment status. */
+  pollingToken: string;
   failureReason: string | null;
   mode: "demo" | "live";
   createdAt: string;
@@ -104,6 +111,8 @@ export type NewTransaction = Pick<
   | "paymentAccount"
   | "paymentMethod"
   | "checkoutRequestId"
+  | "accountReference"
+  | "pollingToken"
   | "mode"
 >;
 
@@ -114,6 +123,7 @@ export type TransactionPatch = Partial<
     | "mpesaReceiptNumber"
     | "failureReason"
     | "checkoutRequestId"
+    | "merchantRequestId"
     | "updatedAt"
   >
 >;

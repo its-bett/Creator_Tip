@@ -5,7 +5,7 @@ Follow this once, then fill the values into `.env.local` locally — don't paste
 ## 1. Create a Daraja account
 
 1. Go to <https://developer.safaricom.co.ke/>.
-2. Click **Register / Sign up** and use `kbett2636@gmail.com`.
+2. Click **Register / Sign up** and use your own email address.
 3. Verify your email and log in.
 
 ## 2. Create a sandbox app
@@ -43,20 +43,20 @@ Copy the `https://...` URL it prints. Your callback URL is:
 https://<your-tunnel-url>/api/tips/callback
 ```
 
-If your Daraja app also asks for a default callback URL in the portal, paste the same URL there. Generate a callback secret too, e.g.:
+If your Daraja app also asks for a default callback URL in the portal, paste the same base URL there. Generate a callback secret too:
 
 ```bash
 openssl rand -hex 24
 ```
 
-The app appends it to the callback URL as `?secret=...` and rejects callbacks that don't include it.
+The app adds `tipId` and an HMAC `sig` to the base URL for every STK push and rejects callbacks whose signature does not match. The secret itself is never sent in the URL or stored in the database.
 
 > ngrok is fine for sandbox only. For production, use a stable HTTPS domain.
 
 ## 5. Configure the app
 
 ```bash
-cd /home/bett/projects/creator-tipping-app
+cd /path/to/creator-tipping-app
 cp .env.example .env.local
 ```
 
@@ -93,8 +93,8 @@ Sandbox test payments reverse automatically, so no real money moves.
 
 - **`Invalid API call as no apiproduct match found`** — the M-Pesa Express product isn't attached to the app that produced your consumer key. Fix it in **My Apps**.
 - **`M-Pesa authentication failed (401)`** — wrong key/secret, or they belong to a different app/environment.
-- **Status stays PENDING** — the callback never reached you. Check ngrok is running, the URL in `.env.local` matches, and the `secret` query parameter matches `MPESA_CALLBACK_SECRET`.
-- **Callback returns 403** — the secret in the URL doesn't match. The app compares it in constant time and rejects mismatches.
+- **Status stays PENDING** — the callback never reached you. Check ngrok is running and `MPESA_CALLBACK_URL` matches the tunnel. The status endpoint also queries Daraja directly every 15 seconds and will settle the tip from that result.
+- **Callback returns 403** — the `tipId`/`sig` pair is missing or the signature does not match `MPESA_CALLBACK_SECRET`. The app compares signatures in constant time and rejects mismatches.
 - **Wrong password errors** — the passkey must match the shortcode, and timestamps are generated in Africa/Nairobi time (the app already does this).
 
 ## Going live later

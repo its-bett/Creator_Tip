@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { getPaymentMethod, PAYMENT_METHODS, validatePaymentInput } from "@/lib/payments";
 import type { CreatorProfile, GiftTier, PaymentMethod } from "@/lib/types";
+import { MAX_TIP, MIN_TIP } from "@/lib/validation";
 
 type Phase = "idle" | "initiating" | "waiting" | "success" | "failed";
 
@@ -54,8 +55,10 @@ export default function CreatorPage({ profile }: { profile: CreatorProfile }) {
   const [customerMessage, setCustomerMessage] = useState("");
   const [transaction, setTransaction] = useState<{
     id: string;
+    pollingToken: string;
     checkoutRequestId: string;
     paymentMethod: PaymentMethod;
+    mode: "demo" | "live";
   } | null>(null);
   const [receipt, setReceipt] = useState<string | null>(null);
 
@@ -84,10 +87,13 @@ export default function CreatorPage({ profile }: { profile: CreatorProfile }) {
 
     const checkStatus = async () => {
       try {
-        const response = await fetch(
-          `/api/tips/status?checkoutRequestId=${encodeURIComponent(transaction.checkoutRequestId)}`,
-          { signal: controller.signal, cache: "no-store" },
-        );
+        const response = await fetch("/api/tips/status", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: transaction.id, token: transaction.pollingToken }),
+          signal: controller.signal,
+          cache: "no-store",
+        });
         if (!response.ok) return;
         const data = (await response.json()) as {
           status: string;
@@ -135,8 +141,8 @@ export default function CreatorPage({ profile }: { profile: CreatorProfile }) {
   const initiate = async () => {
     setError("");
 
-    if (!Number.isFinite(amount) || amount < 50) {
-      setError("Choose an amount of at least KES 50.");
+    if (!Number.isFinite(amount) || amount < MIN_TIP || amount > MAX_TIP) {
+      setError(`Choose an amount between KES ${MIN_TIP} and KES ${formatKes(MAX_TIP)}.`);
       return;
     }
     const paymentInput = validatePaymentInput(paymentMethod, phoneNumber, paymentAccount);
@@ -166,19 +172,23 @@ export default function CreatorPage({ profile }: { profile: CreatorProfile }) {
       const data = (await response.json()) as {
         error?: string;
         transactionId?: string;
+        pollingToken?: string;
         checkoutRequestId?: string;
         customerMessage?: string;
         paymentMethod?: PaymentMethod;
+        mode?: "demo" | "live";
       };
 
-      if (!response.ok || !data.transactionId || !data.checkoutRequestId) {
+      if (!response.ok || !data.transactionId || !data.pollingToken || !data.checkoutRequestId) {
         throw new Error(data.error || "Could not start the payment.");
       }
 
       setTransaction({
         id: data.transactionId,
+        pollingToken: data.pollingToken,
         checkoutRequestId: data.checkoutRequestId,
         paymentMethod: data.paymentMethod ?? paymentMethod,
+        mode: data.mode ?? "demo",
       });
       setCustomerMessage(
         data.customerMessage || "Check your phone for the M-Pesa prompt.",
@@ -193,18 +203,23 @@ export default function CreatorPage({ profile }: { profile: CreatorProfile }) {
   const simulate = async (success: boolean) => {
     if (!transaction) return;
     try {
-      await fetch("/api/tips/demo/complete", {
+      const response = await fetch("/api/tips/demo/complete", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          transactionId: transaction.id,
           checkoutRequestId: transaction.checkoutRequestId,
-          amount,
           success,
-          paymentMethod: transaction.paymentMethod,
         }),
       });
+      if (!response.ok) {
+        const data = (await response.json().catch(() => ({}))) as { error?: string };
+        setError(data.error || "Simulation is unavailable for this payment.");
+        setPhase("failed");
+      }
     } catch {
       setError("Could not simulate the payment. Please try again.");
+      setPhase("failed");
     }
   };
 
@@ -501,13 +516,20 @@ export default function CreatorPage({ profile }: { profile: CreatorProfile }) {
                 </div>
                 <h2 className="mt-4 text-2xl font-black">Thank you!</h2>
                 <p className="mt-2 text-sm text-slate-600">
-                  Your KES {formatKes(amount)} gift via {methodInfo.name} reached{" "}
+                  Your KES {formatKes(amount)} gift via {methodInfo.name}{" "}
+                  {transaction?.mode === "demo" ? "was simulated for" : "reached"}{" "}
                   {creator.displayName}.
                 </p>
-                {receipt && (
+                {receipt ? (
                   <p className="mt-3 rounded-xl bg-slate-100 px-3 py-2 text-xs font-medium text-slate-600">
                     Receipt: {receipt}
                   </p>
+                ) : (
+                  transaction?.mode === "live" && (
+                    <p className="mt-3 text-xs text-slate-500">
+                      Payment confirmed by M-Pesa. Your receipt will appear shortly.
+                    </p>
+                  )
                 )}
                 <button
                   type="button"
@@ -529,7 +551,7 @@ export default function CreatorPage({ profile }: { profile: CreatorProfile }) {
                     : `Account: ${paymentAccount || "your account"}`}
                 </p>
 
-                {(!mpesaLive || paymentMethod !== "mpesa") && (
+                {transaction?.mode === "demo" && (
                   <div className="mt-6 rounded-2xl border border-amber-200 bg-amber-50 p-4">
                     <p className="text-xs font-bold uppercase tracking-wider text-amber-800">
                       {methodInfo.name} simulation
@@ -633,6 +655,7 @@ export default function CreatorPage({ profile }: { profile: CreatorProfile }) {
                           setError("");
                         }}
                         placeholder={methodInfo.placeholder}
+                        maxLength={20}
                         inputMode={methodInfo.inputMode}
                         autoComplete="tel"
                         className="w-full rounded-xl border border-slate-200 px-4 py-3 text-base outline-none transition focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100"
@@ -650,6 +673,7 @@ export default function CreatorPage({ profile }: { profile: CreatorProfile }) {
                           setError("");
                         }}
                         placeholder={methodInfo.placeholder}
+                        maxLength={120}
                         inputMode={methodInfo.inputMode}
                         autoComplete={methodInfo.id === "paypal" ? "email" : "off"}
                         className="w-full rounded-xl border border-slate-200 px-4 py-3 text-base outline-none transition focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100"

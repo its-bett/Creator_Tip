@@ -7,6 +7,7 @@ import {
   DEMO_GIFT_TIERS,
   DEMO_TRANSACTIONS,
 } from "@/lib/seed";
+import { LATE_CALLBACK_GRACE_MINUTES, PAYMENT_TIMEOUT_REASON } from "@/lib/types";
 import type {
   Creator,
   CreatorEarnings,
@@ -107,6 +108,9 @@ function mapTransaction(row: DbRow): Transaction {
       ? String(row.mpesa_receipt_number)
       : null,
     checkoutRequestId: String(row.checkout_request_id),
+    merchantRequestId: row.merchant_request_id ? String(row.merchant_request_id) : null,
+    accountReference: row.account_reference ? String(row.account_reference) : null,
+    pollingToken: String(row.polling_token ?? ""),
     failureReason: row.failure_reason ? String(row.failure_reason) : null,
     mode: row.mode === "live" ? "live" : "demo",
     createdAt: String(row.created_at),
@@ -155,6 +159,9 @@ async function readStore(): Promise<LocalStore> {
       transaction.paymentMethod ??= "mpesa";
       transaction.paymentAccount ??= null;
       transaction.mode ??= "demo";
+      transaction.merchantRequestId ??= null;
+      transaction.accountReference ??= null;
+      transaction.pollingToken ??= `legacy_${transaction.id}`;
     }
     return store;
   } catch (error) {
@@ -320,31 +327,57 @@ export async function getCreatorEarnings(
     };
   }
 
-  const { data: creatorRow, error: creatorError } = await supabase
+  const exact = await supabase
     .from("creators")
     .select("id")
     .eq("username", username)
     .maybeSingle();
+  if (exact.error) throw exact.error;
+
+  const { data: creatorRow, error: creatorError } = exact.data
+    ? { data: exact.data, error: null }
+    : await supabase
+        .from("creators")
+        .select("id")
+        .eq("username", username.toLowerCase())
+        .maybeSingle();
   if (creatorError) throw creatorError;
   if (!creatorRow) return null;
 
   const creatorId = String((creatorRow as DbRow).id);
-  const [totalsResult, transactionsResult] = await Promise.all([
-    supabase
-      .from("creator_stats")
-      .select("total_supported, supporter_count")
-      .eq("creator_id", creatorId)
-      .maybeSingle(),
-    supabase
-      .from("transactions")
-      .select("*")
-      .eq("creator_id", creatorId)
-      .order("created_at", { ascending: false })
-      .limit(20),
-  ]);
+  const [totalsResult, successfulResult, pendingResult, failedResult, transactionsResult] =
+    await Promise.all([
+      supabase
+        .from("creator_stats")
+        .select("total_supported, supporter_count")
+        .eq("creator_id", creatorId)
+        .maybeSingle(),
+      supabase
+        .from("transactions")
+        .select("id", { count: "exact", head: true })
+        .eq("creator_id", creatorId)
+        .eq("status", "SUCCESS"),
+      supabase
+        .from("transactions")
+        .select("id", { count: "exact", head: true })
+        .eq("creator_id", creatorId)
+        .eq("status", "PENDING"),
+      supabase
+        .from("transactions")
+        .select("id", { count: "exact", head: true })
+        .eq("creator_id", creatorId)
+        .eq("status", "FAILED"),
+      supabase
+        .from("transactions")
+        .select("*")
+        .eq("creator_id", creatorId)
+        .order("created_at", { ascending: false })
+        .limit(20),
+    ]);
 
-  if (totalsResult.error) throw totalsResult.error;
-  if (transactionsResult.error) throw transactionsResult.error;
+  for (const result of [totalsResult, successfulResult, pendingResult, failedResult, transactionsResult]) {
+    if (result.error) throw result.error;
+  }
 
   const totals = totalsResult.data as DbRow | null;
   const transactions = (transactionsResult.data ?? []).map((row) =>
@@ -353,10 +386,10 @@ export async function getCreatorEarnings(
 
   return {
     totalSupported: Number(totals?.total_supported ?? 0),
-    supporterCount: Number(totals?.supporter_count ?? 0),
-    successfulCount: transactions.filter((item) => item.status === "SUCCESS").length,
-    pendingCount: transactions.filter((item) => item.status === "PENDING").length,
-    failedCount: transactions.filter((item) => item.status === "FAILED").length,
+    supporterCount: successfulResult.count ?? Number(totals?.supporter_count ?? 0),
+    successfulCount: successfulResult.count ?? 0,
+    pendingCount: pendingResult.count ?? 0,
+    failedCount: failedResult.count ?? 0,
     transactions: transactions.map((item) => ({
       id: item.id,
       supporterName: item.supporterName,
@@ -442,6 +475,138 @@ export async function getTransactionById(id: string): Promise<Transaction | null
 
 /* --------------------------------- mutations --------------------------------- */
 
+function patchToRow(patch: TransactionPatch): DbRow {
+  const row: DbRow = {};
+  if (patch.status !== undefined) row.status = patch.status;
+  if (patch.mpesaReceiptNumber !== undefined) row.mpesa_receipt_number = patch.mpesaReceiptNumber;
+  if (patch.failureReason !== undefined) row.failure_reason = patch.failureReason;
+  if (patch.checkoutRequestId !== undefined) row.checkout_request_id = patch.checkoutRequestId;
+  if (patch.merchantRequestId !== undefined) row.merchant_request_id = patch.merchantRequestId;
+  if (patch.updatedAt !== undefined) row.updated_at = patch.updatedAt;
+  return row;
+}
+
+async function updateLocalTransaction(
+  id: string,
+  patch: TransactionPatch,
+  canUpdate: (transaction: Transaction) => boolean,
+): Promise<Transaction | null> {
+  const values = { ...patch, updatedAt: patch.updatedAt ?? new Date().toISOString() };
+  const definedValues = Object.fromEntries(
+    Object.entries(values).filter(([, value]) => value !== undefined),
+  ) as TransactionPatch;
+  const result: { transaction: Transaction | null } = { transaction: null };
+
+  await withStore((store) => {
+    const index = store.transactions.findIndex((item) => item.id === id);
+    if (index === -1 || !canUpdate(store.transactions[index])) return;
+    store.transactions[index] = { ...store.transactions[index], ...definedValues };
+    result.transaction = store.transactions[index];
+  });
+
+  return result.transaction;
+}
+
+/** Updates only while the transaction is still awaiting its first payment result. */
+export async function completePendingTransaction(
+  id: string,
+  patch: TransactionPatch,
+): Promise<Transaction | null> {
+  const values = { ...patch, updatedAt: patch.updatedAt ?? new Date().toISOString() };
+  const supabase = getSupabaseAdmin();
+
+  if (!supabase) {
+    return updateLocalTransaction(id, values, (item) => item.status === "PENDING");
+  }
+
+  const { data, error } = await supabase
+    .from("transactions")
+    .update(patchToRow(values))
+    .eq("id", id)
+    .eq("status", "PENDING")
+    .select("*")
+    .maybeSingle();
+
+  if (error) throw error;
+  return data ? mapTransaction(data as DbRow) : null;
+}
+
+/**
+ * A late callback may arrive after the UI timed out. Allow it to recover a
+ * transaction we expired ourselves, but never overwrite a real failure.
+ */
+export async function completeTimedOutTransaction(
+  id: string,
+  patch: TransactionPatch,
+): Promise<Transaction | null> {
+  const supabase = getSupabaseAdmin();
+  const graceCutoff = Date.now() - LATE_CALLBACK_GRACE_MINUTES * 60_000;
+
+  const canRecover = (item: Transaction) =>
+    item.status === "FAILED" &&
+    item.failureReason === PAYMENT_TIMEOUT_REASON &&
+    new Date(item.updatedAt).getTime() >= graceCutoff;
+
+  if (!supabase) {
+    return updateLocalTransaction(id, patch, canRecover);
+  }
+
+  const { data: current, error: readError } = await supabase
+    .from("transactions")
+    .select("status, failure_reason, updated_at")
+    .eq("id", id)
+    .maybeSingle();
+  if (readError) throw readError;
+  if (
+    !current ||
+    current.status !== "FAILED" ||
+    current.failure_reason !== PAYMENT_TIMEOUT_REASON ||
+    new Date(String(current.updated_at)).getTime() < graceCutoff
+  ) {
+    return null;
+  }
+
+  const { data, error } = await supabase
+    .from("transactions")
+    .update(patchToRow(patch))
+    .eq("id", id)
+    .eq("status", "FAILED")
+    .eq("failure_reason", PAYMENT_TIMEOUT_REASON)
+    .select("*")
+    .maybeSingle();
+
+  if (error) throw error;
+  return data ? mapTransaction(data as DbRow) : null;
+}
+
+/** Lets a late callback add a receipt to a payment already confirmed by STK query. */
+export async function attachMpesaReceipt(
+  id: string,
+  receipt: string,
+): Promise<Transaction | null> {
+  const supabase = getSupabaseAdmin();
+
+  if (!supabase) {
+    return updateLocalTransaction(
+      id,
+      { mpesaReceiptNumber: receipt },
+      (item) => item.status === "SUCCESS" && item.mpesaReceiptNumber === null,
+    );
+  }
+
+  const { data, error } = await supabase
+    .from("transactions")
+    .update({ mpesa_receipt_number: receipt })
+    .eq("id", id)
+    .eq("status", "SUCCESS")
+    .is("mpesa_receipt_number", null)
+    .select("*")
+    .maybeSingle();
+
+  if (error) throw error;
+  return data ? mapTransaction(data as DbRow) : null;
+}
+
 export async function createTransaction(input: NewTransaction): Promise<Transaction> {
   const now = new Date().toISOString();
   const transaction: Transaction = {
@@ -449,6 +614,7 @@ export async function createTransaction(input: NewTransaction): Promise<Transact
     ...input,
     status: "PENDING",
     mpesaReceiptNumber: null,
+    merchantRequestId: null,
     failureReason: null,
     createdAt: now,
     updatedAt: now,
@@ -477,6 +643,8 @@ export async function createTransaction(input: NewTransaction): Promise<Transact
       mode: transaction.mode,
       status: transaction.status,
       checkout_request_id: transaction.checkoutRequestId,
+      account_reference: transaction.accountReference,
+      polling_token: transaction.pollingToken,
     })
     .select("*")
     .single();
@@ -493,11 +661,14 @@ export async function updateTransaction(
 
   const supabase = getSupabaseAdmin();
   if (!supabase) {
+    const definedValues = Object.fromEntries(
+      Object.entries(values).filter(([, value]) => value !== undefined),
+    ) as TransactionPatch;
     const result: { transaction: Transaction | null } = { transaction: null };
     await withStore((store) => {
       const index = store.transactions.findIndex((item) => item.id === id);
       if (index === -1) return;
-      store.transactions[index] = { ...store.transactions[index], ...values };
+      store.transactions[index] = { ...store.transactions[index], ...definedValues };
       result.transaction = store.transactions[index];
     });
     return result.transaction;
@@ -505,13 +676,7 @@ export async function updateTransaction(
 
   const { data, error } = await supabase
     .from("transactions")
-    .update({
-      status: values.status,
-      mpesa_receipt_number: values.mpesaReceiptNumber,
-      failure_reason: values.failureReason,
-      checkout_request_id: values.checkoutRequestId,
-      updated_at: values.updatedAt,
-    })
+    .update(patchToRow(values))
     .eq("id", id)
     .select("*")
     .maybeSingle();

@@ -4,7 +4,9 @@ import {
   getTierById,
   updateTransaction,
 } from "@/lib/db";
+import { createOpaqueToken } from "@/lib/crypto";
 import {
+  buildMpesaCallbackUrl,
   createAccountReference,
   createCheckoutRequestId,
   initiateStkPush,
@@ -81,6 +83,8 @@ export async function POST(request: Request) {
     }
 
     const useLiveMpesa = paymentMethod === "mpesa" && isMpesaConfigured();
+    const accountReference = useLiveMpesa ? createAccountReference() : null;
+    const pollingToken = createOpaqueToken();
     const transaction = await createTransaction({
       creatorId: creator.id,
       supporterName,
@@ -92,38 +96,47 @@ export async function POST(request: Request) {
       paymentMethod,
       mode: useLiveMpesa ? "live" : "demo",
       checkoutRequestId: createCheckoutRequestId(),
+      accountReference,
+      pollingToken,
     });
 
     let customerMessage = DEMO_MESSAGES[paymentMethod];
 
     if (useLiveMpesa) {
-      const callbackSecret = process.env.MPESA_CALLBACK_SECRET;
-      const callbackBase =
-        process.env.MPESA_CALLBACK_URL || `${new URL(request.url).origin}/api/tips/callback`;
-      const callbackUrl = callbackSecret
-        ? `${callbackBase}${callbackBase.includes("?") ? "&" : "?"}secret=${encodeURIComponent(callbackSecret)}`
-        : callbackBase;
+      const callbackBase = process.env.MPESA_CALLBACK_URL as string;
+      const callbackUrl = buildMpesaCallbackUrl(callbackBase, transaction.id);
 
       try {
         const result = await initiateStkPush({
           amount,
           phoneNumber: paymentInput.phoneNumber,
           callbackUrl,
-          accountReference: createAccountReference(),
+          accountReference: accountReference as string,
           transactionDesc: `Support ${creator.displayName}`,
         });
 
-        await updateTransaction(transaction.id, {
-          checkoutRequestId: result.checkoutRequestId,
-        });
-
         customerMessage = result.customerMessage;
+
+        // The signed callback carries our transaction ID, so a failed mapping
+        // update cannot lose the payment. It only disables STK-query fallback.
+        try {
+          await updateTransaction(transaction.id, {
+            checkoutRequestId: result.checkoutRequestId,
+            merchantRequestId: result.merchantRequestId || undefined,
+          });
+        } catch (error) {
+          console.error("[mpesa] could not store Daraja checkout mapping", {
+            transactionId: transaction.id,
+            error: error instanceof Error ? error.message : error,
+          });
+        }
 
         return Response.json({
           success: true,
           mode: "live",
           paymentMethod,
           transactionId: transaction.id,
+          pollingToken,
           checkoutRequestId: result.checkoutRequestId,
           customerMessage,
         });
@@ -152,6 +165,7 @@ export async function POST(request: Request) {
       paymentMethod,
       methodName: getPaymentMethod(paymentMethod).name,
       transactionId: transaction.id,
+      pollingToken,
       checkoutRequestId: transaction.checkoutRequestId,
       customerMessage,
     });

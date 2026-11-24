@@ -30,9 +30,9 @@ values
   ('bbbbbbb3-0000-4000-8000-000000000003', '22222222-2222-4222-8222-222222222222', 'Kiln time', 1500, '🔥', false, 3)
 on conflict (id) do nothing;
 
-insert into public.transactions (id, creator_id, supporter_name, supporter_message, gift_title, amount, phone_number, status, mpesa_receipt_number, checkout_request_id)
+insert into public.transactions (id, creator_id, supporter_name, supporter_message, gift_title, amount, phone_number, status, mpesa_receipt_number, checkout_request_id, polling_token)
 values
-  ('33333333-3333-4333-8333-333333333333', '11111111-1111-4111-8111-111111111111', 'Amina', 'The Mombasa sunset series is unreal. Keep going!', 'Coffee', 300, '254712345678', 'SUCCESS', 'DEMO8K2P41', 'demo_seed_1'),
-  ('44444444-4444-4444-8444-444444444444', '11111111-1111-4111-8111-111111111111', 'Brian K.', 'For the next road trip 🚗', 'Lunch', 500, '254733345678', 'SUCCESS', 'DEMO4M9X22', 'demo_seed_2'),
-  ('55555555-5555-4555-8555-555555555555', '22222222-2222-4222-8222-222222222222', 'Njeri', 'Can''t wait for the new mugs!', 'Glaze fund', 600, '254722345678', 'SUCCESS', 'DEMO7T1Q80', 'demo_seed_3')
+  ('33333333-3333-4333-8333-333333333333', '11111111-1111-4111-8111-111111111111', 'Amina', 'The Mombasa sunset series is unreal. Keep going!', 'Coffee', 300, '254712345678', 'SUCCESS', 'DEMO8K2P41', 'demo_seed_1', 'demo_polling_token_seed_1'),
+  ('44444444-4444-4444-8444-444444444444', '11111111-1111-4111-8111-111111111111', 'Brian K.', 'For the next road trip 🚗', 'Lunch', 500, '254710345678', 'SUCCESS', 'DEMO4M9X22', 'demo_seed_2', 'demo_polling_token_seed_2'),
+  ('55555555-5555-4555-8555-555555555555', '22222222-2222-4222-8222-222222222222', 'Njeri', 'Can''t wait for the new mugs!', 'Glaze fund', 600, '254722345678', 'SUCCESS', 'DEMO7T1Q80', 'demo_seed_3', 'demo_polling_token_seed_3')
 on conflict (id) do nothing;

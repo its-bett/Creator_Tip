@@ -34,7 +34,7 @@ Two sample profiles are available:
 - `/wanjiku_makes` → a second creator, to demonstrate dynamic profile routes
 - `/dashboard/1._coastspoter` → the private creator dashboard. Locally the access code is `tipjar-demo`; set `CREATOR_DASHBOARD_TOKEN` in `.env.local` to choose your own.
 
-In demo mode the checkout modal offers **Simulate success** and **Cancel payment** buttons, which feed a synthetic callback through the same callback processor used in production. Each method has its own input field: phone number for M-Pesa/Airtel, email for PayPal, and Pay ID or email for Binance Pay. Receipts are prefixed `MP`, `AR`, `PP` and `BN` respectively.
+In demo mode the checkout modal offers **Simulate success** and **Cancel payment** buttons, which feed a synthetic callback through the same callback processor used in production. Each method has its own input field: phone number for M-Pesa/Airtel, email for PayPal, and Pay ID or email for Binance Pay. Receipts are prefixed `MP`, `AR`, `PP` and `BN` respectively. Simulation is available outside production, or in production only when `ALLOW_DEMO_PAYMENTS=true`; it only works on transactions whose own mode is `demo`.
 
 ```bash
 npm run build   # production build
@@ -74,10 +74,10 @@ MPESA_CALLBACK_SECRET=a-long-random-string
 ```
 
 3. Register `MPESA_CALLBACK_URL` in your Daraja app. Safaricom must be able to reach it over HTTPS — `localhost` will not work. Use a tunnel (e.g. ngrok) for sandbox testing.
-4. When the callback secret is set, the app appends it as `?secret=...` to the callback URL and rejects callbacks that don't include it. For live deployment, rotate to a fresh secret and register the new URL.
+4. The app adds `tipId` and an HMAC `sig` to that base URL for each STK push. The callback route verifies the signature and uses `tipId` to match the payment, so a static secret is never sent in the URL. Keep `MPESA_CALLBACK_SECRET` server-side and rotate it to invalidate outstanding callbacks.
 5. For production, set `MPESA_BASE_URL=https://api.safaricom.co.ke` with your paybill shortcode and passkey after Safaricom go-live approval.
 
-No STK push is sent until **all four** Daraja variables are present; otherwise the app stays in demo mode.
+No STK push is sent until **all six** values are present (consumer key/secret, shortcode, passkey, callback URL and callback secret); otherwise the app stays in demo mode.
 
 ## API
 
@@ -87,16 +87,16 @@ No STK push is sent until **all four** Daraja variables are present; otherwise t
 | `POST` | `/api/creators/[username]/earnings` | Private earnings; requires `Authorization: Bearer <code>` or `{ "token": "<code>" }` |
 | `POST` | `/api/tips/initiate` | Validate tip, create `PENDING` transaction, start STK push |
 | `POST` | `/api/tips/callback` | Daraja webhook; updates transaction from `ResultCode` |
-| `GET` | `/api/tips/status?id=…` or `?checkoutRequestId=…` | Poll payment state for the checkout UI |
+| `GET` / `POST` | `/api/tips/status` | Read payment state (`GET`) or reconcile a pending M-Pesa tip (`POST`); requires `id` + `token` from initiate |
 | `POST` | `/api/tips/demo/complete` | Local-only provider simulation for all four methods (404 in live mode) |
 
 ## Payment flow
 
-1. `POST /api/tips/initiate` stores a `PENDING` transaction with its `payment_method` (amount always taken from the stored gift tier, never from the browser).
-2. For live M-Pesa, Daraja returns a `CheckoutRequestID`, which is saved on the transaction. Demo methods generate a local reference.
-3. The UI polls `/api/tips/status` every two seconds while showing “Waiting for M-Pesa”.
-4. `/api/tips/callback` verifies the secret, finds the transaction, and writes `SUCCESS` (with receipt) or `FAILED` (with reason). Repeated callbacks are ignored.
-5. Prompts that never receive a callback expire after `PAYMENT_TIMEOUT_MINUTES`.
+1. `POST /api/tips/initiate` stores a `PENDING` transaction with a private polling token, its `payment_method` and an account reference (amount always taken from the stored gift tier, never from the browser).
+2. For live M-Pesa, the callback URL is signed per transaction. Daraja's `CheckoutRequestID` and `MerchantRequestID` are saved when the STK push is accepted; demo methods generate a local reference.
+3. The UI reconciles with `POST /api/tips/status` every two seconds while showing “Waiting for M-Pesa”. Status lookups require the polling token, so knowing a transaction ID is not enough to read it.
+4. `/api/tips/callback` verifies the HMAC, matches the signed transaction ID, requires the exact amount and a receipt, and atomically writes `SUCCESS` or `FAILED`. Repeated callbacks are ignored; a late success can still attach a receipt or recover a timed-out tip.
+5. If callbacks are slow, the status endpoint queries Daraja's STK-query API (throttled) and records the result. Prompts with no confirmation expire after `PAYMENT_TIMEOUT_MINUTES`.
 
 ## Private earnings
 
@@ -109,7 +109,7 @@ Public routes never return `total_supported` or per-transaction amounts/receipts
 - Secrets are read from server-side environment variables only.
 - Money figures and receipts are absent from public profile JSON, the profile UI and the supporter wall; the earnings endpoint is the only way to read them.
 - Public RLS allows reading profiles/tiers; all transaction reads and writes use the service role.
-- Callback secret is compared in constant time; amount mismatches between callback and stored transaction are rejected.
+- Each live callback URL carries a transaction ID and an HMAC signature (constant-time verified); a static secret is never sent in the URL. Amount, receipt and checkout IDs are strictly checked against the stored transaction, and status updates are atomic.
 - Basic per-IP rate limiting is built in (15 requests/minute per process). Use a shared store such as Upstash when running multiple instances.
 - Before accepting real money: enable HTTPS, add monitoring/alerting for failed callbacks, reconcile against Daraja settlement reports, and confirm Safaricom's business verification.
 - To make Airtel Money, PayPal or Binance Pay real, add merchant credentials and a provider-specific adapter/webhook behind the existing `paymentMethod` field; the checkout and status UI will not need to change.

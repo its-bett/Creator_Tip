@@ -54,6 +54,9 @@ create table if not exists public.transactions (
   status transaction_status not null default 'PENDING',
   mpesa_receipt_number text,
   checkout_request_id text not null unique,
+  merchant_request_id text,
+  account_reference text,
+  polling_token text,
   failure_reason text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
@@ -78,6 +81,20 @@ alter table public.transactions add constraint transactions_payment_method_check
 alter table public.transactions drop constraint if exists transactions_mode_check;
 alter table public.transactions add constraint transactions_mode_check
   check (mode in ('demo', 'live'));
+
+-- Upgrade existing installations created before payment correlation hardening -
+alter table public.transactions add column if not exists merchant_request_id text;
+alter table public.transactions add column if not exists account_reference text;
+alter table public.transactions add column if not exists polling_token text;
+update public.transactions
+  set polling_token = encode(gen_random_bytes(24), 'hex')
+  where polling_token is null;
+alter table public.transactions alter column polling_token set not null;
+
+create unique index if not exists transactions_polling_token_key
+  on public.transactions(polling_token);
+create index if not exists transactions_merchant_request_id_idx
+  on public.transactions(merchant_request_id);
 
 -- Upgrade existing installations created before public profile stats ------------
 alter table public.creators add column if not exists followers integer not null default 0;
@@ -106,6 +123,10 @@ select
 from public.creators c
 left join public.transactions t on t.creator_id = c.id
 group by c.id;
+
+-- Earnings are private: this view is read by the service role only.
+revoke all on public.creator_stats from anon, authenticated;
+grant select on public.creator_stats to service_role;
 
 -- Row Level Security ------------------------------------------------------------
 -- Profiles and gift tiers are public. Writes and all transaction reads go through
